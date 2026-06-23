@@ -5,6 +5,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
+from pprint import pprint
 
 import requests
 import socket
@@ -44,9 +45,11 @@ class VPNMonitor:
         Метод `get_best_node` возвращает блок `outbounds` лучшей найденной ноды
         либо `None`, если список серверов пустой или ни одна нода не прошла тест.
     """
+
     def __init__(self):
         self.xray_url = os.getenv("xray_url")
         self.x_hwid = os.getenv("X-Hwid")
+        self.port_client_xray = os.getenv("port_client_xray")
 
         self.url = "https://api.telegram.org"
         self.timeout = 12
@@ -58,7 +61,7 @@ class VPNMonitor:
             "X-App-Version": "2.8.0",
             "X-Device-Locale": "RU",
             "X-Device-Os": "Windows",
-            "X-Device-Model": "AO-IT-5_x86_64",
+            "X-Device-Model": "AO-x86_64",
             "X-Hwid": self.x_hwid,
             "X-Ver-Os": "10_10.0.19045",
             "Accept-Encoding": "gzip, deflate",
@@ -76,14 +79,25 @@ class VPNMonitor:
         response.encoding = "utf-8"
         txt = response.text.strip()
         ls_vpn = json.loads(txt)
-        ls_vpn = [vpn for vpn in ls_vpn if vpn['outbounds'][0]['protocol']=='vless']
+        ls_vpn = [vpn for vpn in ls_vpn if vpn['outbounds'][0]['protocol'] == 'vless']
+        for n, node in enumerate(ls_vpn):
+            node['num_node'] = n
         return ls_vpn
 
-    def get_free_port(self) -> int:
-        """Возвращает свободный локальный TCP-порт."""
+    def _get_free_port_sync(self) -> int:
+        """Синхронно возвращает свободный локальный TCP-порт."""
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
+
+    async def get_free_port(self) -> int:
+        """
+        Асинхронно возвращает свободный локальный TCP-порт.
+
+        Сама операция с socket является синхронной, поэтому она выполняется
+        в отдельном потоке через asyncio.to_thread(), чтобы не блокировать event loop.
+        """
+        return await asyncio.to_thread(self._get_free_port_sync)
 
     def normalize_outbounds(self, outbounds: list) -> list:
         """
@@ -255,9 +269,10 @@ class VPNMonitor:
             except OSError:
                 pass
 
-    async def test_candidate(self, xray_bin: str, outbound) -> dict:
+    async def test_candidate(self, xray_bin: str, num_node) -> dict:
         """Тестирует один JSON-кандидат через временный Xray-процесс."""
-        port = self.get_free_port()
+        port = await self.get_free_port()
+        outbound = self.vpn_servers[num_node]['outbounds']
         temp_config = self.build_temp_config(outbound, port)
 
         with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False, encoding="utf-8") as file:
@@ -282,7 +297,7 @@ class VPNMonitor:
                 }
 
             result = await self.curl_test(port)
-            result['outbound'] = outbound
+            result['num_node'] = num_node
             return result
 
         finally:
@@ -305,25 +320,99 @@ class VPNMonitor:
         project_dir = Path(__file__).resolve().parent
         xray_bin = project_dir / "xray" / "xray.exe"
 
-        tasks = [asyncio.create_task(self.test_candidate(xray_bin, row["outbounds"])) for row in self.vpn_servers]
+        tasks = [asyncio.create_task(self.test_candidate(xray_bin, row["num_node"])) for row in self.vpn_servers]
         best_time_total = 100
-        best_outbounds = None
+        num_node = None
 
         for coro in asyncio.as_completed(tasks):
             result = await coro
-            print(result)
+            # print(result)
             if result['ok'] and result['time_total'] < best_time_total:
                 best_time_total = result['time_total']
-                best_outbounds = result['outbound']
+                num_node = result['num_node']
 
-        print('*********************')
-        print(f'{best_time_total=}')
-        print(f'{best_outbounds=}')
+        # print('*********************')
+        # print(f'{best_time_total=}')
+        # print(f'{num_node=}')
 
-        return best_outbounds
+        best_node = self.vpn_servers[num_node]
+        return best_node
+
+    def create_new_config(self, best_node: dict) -> dict:
+        best_node = copy.deepcopy(best_node)
+        best_node.pop("num_node", None)
+
+        best_node["inbounds"] = [
+            {
+                "listen": "127.0.0.1",
+                "port": self.port_client_xray,
+                "sniffing": {
+                    "routeOnly": False,
+                    "enabled": True,
+                    "destOverride": [
+                        "http",
+                        "quic",
+                        "tls"
+                    ]
+                },
+                "protocol": "socks",
+                "settings": {
+                    "udp": True
+                },
+                "tag": "socks"
+            }
+        ]
+        best_node["outbounds"] = self.normalize_outbounds(best_node["outbounds"])
+        return best_node
+
+    def save_new_config(self, new_config: dict):
+        project_dir = Path(__file__).resolve().parent
+        config_path = project_dir / "new_config.json"
+
+        with config_path.open("w", encoding="utf-8") as file:
+            json.dump(new_config, file, ensure_ascii=False, indent=2)
+
+    async def run_pipeline(self):
+        print("Выбор лучшей ноды...")
+        best_node = await self.get_best_node()
+
+        # pprint(best_node)
+
+        if not best_node:
+            print("Не удалось выбрать лучшую ноду.")
+            return
+
+        print(f"Лучшая нода: {best_node['remarks']}")
+        new_config = self.create_new_config(best_node)
+        self.save_new_config(new_config)
+        print("Файл конфигурации создан.")
+
+    async def scheduler(self, interval: int = 30):
+        """ Асинхронный scheduler.
+
+        Запускает `curl_test()` в бесконечном цикле с паузой `interval` секунд
+        между завершением одного запуска и началом следующего.
+
+        Args:
+            interval: пауза между запусками в секундах.
+        """
+        while True:
+            try:
+                res = await self.curl_test(self.port_client_xray)
+                if not res['ok']:
+                    print(f"{res}\nСтарт обновления конфигурации xray.")
+                    await self.run_pipeline()
+
+            except Exception as error:
+                print(f"Ошибка в scheduler: {error}")
+
+            await asyncio.sleep(interval)
+
 
 if __name__ == '__main__':
     vpn = VPNMonitor()
     # print(vpn.vpn_servers)
-    asyncio.run(vpn.get_best_node())
+    # asyncio.run(vpn.get_best_node())
+    asyncio.run(vpn.run_pipeline())
+    # asyncio.run(vpn.scheduler())
     # vpn.diagnoctic()
