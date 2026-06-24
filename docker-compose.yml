@@ -15,14 +15,8 @@ services:
 
     volumes:
       - ./:/app
-
-      # Бинарник Xray с хостовой машины.
-      - /usr/local/bin/xray:/usr/local/bin/xray:ro
-
-      # Рабочая директория конфигурации Xray с хостовой машины.
-      # Контейнер сможет заменить /usr/local/etc/xray/config.json.
+      - ./xray-bin:/xray-bin:ro
       - /usr/local/etc/xray:/usr/local/etc/xray
-
       # Нужно для systemctl restart xray из контейнера.
       - /run/systemd:/run/systemd
       - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
