@@ -1,0 +1,30 @@
+services:
+  vpn-monitor:
+    image: image-xray-monitor
+    container_name: vpn-monitor
+    restart: unless-stopped
+
+    network_mode: host
+    pid: host
+    privileged: true
+
+    env_file:
+      - .env
+
+    working_dir: /app
+
+    volumes:
+      - ./:/app
+
+      # Бинарник Xray с хостовой машины.
+      - /usr/local/bin/xray:/usr/local/bin/xray:ro
+
+      # Рабочая директория конфигурации Xray с хостовой машины.
+      # Контейнер сможет заменить /usr/local/etc/xray/config.json.
+      - /usr/local/etc/xray:/usr/local/etc/xray
+
+      # Нужно для systemctl restart xray из контейнера.
+      - /run/systemd:/run/systemd
+      - /run/dbus/system_bus_socket:/run/dbus/system_bus_socket
+
+    command: python main.py

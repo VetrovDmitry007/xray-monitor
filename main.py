@@ -2,18 +2,20 @@ import asyncio
 import copy
 import json
 import os
+import shutil
 import tempfile
 import time
 from pathlib import Path
 from pprint import pprint
-
 import requests
 import socket
 import subprocess
 from dotenv import load_dotenv
 
-load_dotenv()
+from log_utils import setup_logging, get_logger
 
+load_dotenv()
+setup_logging()
 
 class VPNMonitor:
     """
@@ -47,15 +49,24 @@ class VPNMonitor:
     """
 
     def __init__(self):
+        self.logger = get_logger(__name__)
+        self.logger.info("Инициализация класса VPNMonitor ...")
         self.xray_url = os.getenv("xray_url")
         self.x_hwid = os.getenv("X-Hwid")
-        self.port_client_xray = os.getenv("port_client_xray")
+        self.bin_xray = os.getenv("bin_xray")
+        self.config_xray = os.getenv("config_xray")
+        self.restart_xray_cmd = os.getenv("restart_xray_cmd", "systemctl restart xray")
+        self.port_client_xray = int(os.getenv("port_client_xray", "1080"))
 
         self.url = "https://api.telegram.org"
         self.timeout = 12
-        self.vpn_servers = self.get_vpn_servers()
+        self.vpn_servers = None
 
     def get_vpn_servers(self) -> list:
+        """ Получение списка нод.
+
+        :return: Список нод (адреса VPN серверов)
+        """
         headers = {
             "User-Agent": "Happ/2.8.0/Windows/2604081205607",
             "X-App-Version": "2.8.0",
@@ -70,11 +81,11 @@ class VPNMonitor:
         try:
             response = requests.get(self.xray_url, headers=headers)
         except:
-            print('Ошибка получения списка нод с https://sub.harknmav.fun')
+            self.logger.error('Ошибка получения списка нод с https://sub.harknmav.fun')
             return []
 
         if response.status_code != 200:
-            print(f'{response.status_code=}')
+            self.logger.error(f'Ошибка запроса списка нод, {response.status_code=}')
             return []
         response.encoding = "utf-8"
         txt = response.text.strip()
@@ -82,6 +93,7 @@ class VPNMonitor:
         ls_vpn = [vpn for vpn in ls_vpn if vpn['outbounds'][0]['protocol'] == 'vless']
         for n, node in enumerate(ls_vpn):
             node['num_node'] = n
+        self.logger.info(f'Получен список из {len(ls_vpn)} нод.')
         return ls_vpn
 
     def _get_free_port_sync(self) -> int:
@@ -164,6 +176,7 @@ class VPNMonitor:
         - speed_download: средняя скорость скачивания ответа в байтах в секунду.
         - elapsed: фактическое время выполнения subprocess-запуска curl в Python.
         """
+        self.logger.warning("Проверка доступа к сервису Telegram.")
         cmd = [
             "curl",
             "--proxy",
@@ -317,23 +330,23 @@ class VPNMonitor:
         if not len(self.vpn_servers):
             return
 
-        project_dir = Path(__file__).resolve().parent
-        xray_bin = project_dir / "xray" / "xray.exe"
+        # project_dir = Path(__file__).resolve().parent
+        # xray_bin = project_dir / "xray" / "xray.exe"
 
-        tasks = [asyncio.create_task(self.test_candidate(xray_bin, row["num_node"])) for row in self.vpn_servers]
+        tasks = [asyncio.create_task(self.test_candidate(self.bin_xray, row["num_node"])) for row in self.vpn_servers]
         best_time_total = 100
         num_node = None
 
         for coro in asyncio.as_completed(tasks):
             result = await coro
-            # print(result)
+            self.logger.debug(result)
             if result['ok'] and result['time_total'] < best_time_total:
                 best_time_total = result['time_total']
                 num_node = result['num_node']
 
-        # print('*********************')
-        # print(f'{best_time_total=}')
-        # print(f'{num_node=}')
+        self.logger.debug('*********************')
+        self.logger.debug(f'{best_time_total=}')
+        self.logger.debug(f'Best {num_node=}')
 
         best_node = self.vpn_servers[num_node]
         return best_node
@@ -371,21 +384,77 @@ class VPNMonitor:
 
         with config_path.open("w", encoding="utf-8") as file:
             json.dump(new_config, file, ensure_ascii=False, indent=2)
+        return config_path
 
     async def run_pipeline(self):
-        print("Выбор лучшей ноды...")
+        if not self.vpn_servers:
+            self.vpn_servers = self.get_vpn_servers()
+
+        self.logger.info("Выбор лучшей ноды...")
         best_node = await self.get_best_node()
 
-        # pprint(best_node)
-
         if not best_node:
-            print("Не удалось выбрать лучшую ноду.")
+            self.logger.error("Не удалось выбрать лучшую ноду.")
             return
 
-        print(f"Лучшая нода: {best_node['remarks']}")
+        self.logger.info(f"Лучшая нода: {best_node['remarks']}")
         new_config = self.create_new_config(best_node)
-        self.save_new_config(new_config)
-        print("Файл конфигурации создан.")
+        config_path = self.save_new_config(new_config)
+        self.logger.info(f"Файл конфигурации создан: {config_path}")
+        return config_path
+
+    async def rebot_xray(self):
+        """Перезапускает системный сервис Xray."""
+        self.logger.info("Перезапуск xray: systemctl restart xray")
+
+        proc = await asyncio.create_subprocess_exec(
+            "systemctl",
+            "restart",
+            "xray",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+
+        stdout, stderr = await proc.communicate()
+
+        if proc.returncode != 0:
+            error_text = stderr.decode("utf-8", errors="replace").strip()
+            self.logger.error(f"Ошибка перезапуска xray: {error_text}")
+            return False
+
+        self.logger.info("Xray успешно перезапущен.")
+        return True
+
+    async def movi_config(self, config_path):
+        """
+        Копирует новый конфиг поверх config_xray
+        и перезапускает xray.
+        """
+        if not config_path:
+            self.logger.error("movi_config: config_path не передан.")
+            return False
+
+        if not self.config_xray:
+            self.logger.error("movi_config: в .env не задан config_xray.")
+            return False
+
+        source_config = Path(config_path)
+        target_config = Path(self.config_xray)
+
+        if not source_config.exists():
+            self.logger.error(f"Новый конфиг не найден: {source_config}")
+            return False
+
+        self.logger.info(f"Копирование конфига: {source_config} -> {target_config}")
+
+        try:
+            shutil.copy2(source_config, target_config)
+        except Exception as error:
+            self.logger.error(f"Ошибка копирования конфига: {error}")
+            return False
+
+        self.logger.info("Конфиг Xray успешно заменён.")
+
 
     async def scheduler(self, interval: int = 30):
         """ Асинхронный scheduler.
@@ -396,23 +465,38 @@ class VPNMonitor:
         Args:
             interval: пауза между запусками в секундах.
         """
+        self.logger.info("Старт scheduler.")
         while True:
             try:
                 res = await self.curl_test(self.port_client_xray)
                 if not res['ok']:
-                    print(f"{res}\nСтарт обновления конфигурации xray.")
-                    await self.run_pipeline()
+                    self.logger.warning("Отсутствие доступа к сервису Telegram.")
+                    self.logger.info("Старт обновления конфигурации xray.")
+
+                    self.vpn_servers = self.get_vpn_servers()
+                    config_path = await self.run_pipeline()
+                    await self.movi_config(config_path)
+                    await self.rebot_xray()
+
+                    res = await self.curl_test(self.port_client_xray)
+                    if not res['ok']:
+                        self.logger.warning("Отсутствие доступа к сервису Telegram.")
+                    else:
+                        self.logger.info("Успешный доступ к сервису Telegram.")
 
             except Exception as error:
-                print(f"Ошибка в scheduler: {error}")
+                self.logger.error(f"Ошибка в scheduler: {error}")
 
+            self.logger.info(f"Следующая проверка через {interval} сек.")
+            self.logger.info(f"{'*'*30}")
             await asyncio.sleep(interval)
 
 
 if __name__ == '__main__':
+    # setup_logging(level='debug')
     vpn = VPNMonitor()
     # print(vpn.vpn_servers)
     # asyncio.run(vpn.get_best_node())
-    asyncio.run(vpn.run_pipeline())
-    # asyncio.run(vpn.scheduler())
+    # asyncio.run(vpn.run_pipeline())
+    asyncio.run(vpn.scheduler())
     # vpn.diagnoctic()
