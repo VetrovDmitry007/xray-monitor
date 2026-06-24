@@ -1,0 +1,40 @@
+# 1. git clone
+cd /root/Project
+git clone https://github.com/VetrovDmitry007/xray-monitor.git
+cd /root/Project/xray-monitor
+git checkout dev
+
+# 2. Создание виртуального окружения
+cd /root/Project
+python3 -m venv .venv-xray-monitor
+source .venv-xray-monitor/bin/activate
+pip install -r /root/Project/xray-monitor/requirements.txt
+
+# 3. Создание демона
+nano /etc/systemd/system/xray-monitor.service
+--------------
+[Unit]
+Description=Xray Monitor
+After=network-online.target xray.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/Project/xray-monitor
+ExecStart=/root/Project/.venv-xray-monitor/bin/python -u /root/Project/xray-monitor/main.py
+Restart=always
+RestartSec=10
+EnvironmentFile=/root/Project/xray-monitor/.env
+
+[Install]
+WantedBy=multi-user.target
+---------------
+
+# 4. Запуск демона
+systemctl daemon-reload
+systemctl enable xray-monitor
+systemctl start xray-monitor
+
+systemctl status xray-monitor
+# Лог в реальном времени
+journalctl -u xray-monitor -f
