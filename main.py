@@ -176,7 +176,6 @@ class VPNMonitor:
         - speed_download: средняя скорость скачивания ответа в байтах в секунду.
         - elapsed: фактическое время выполнения subprocess-запуска curl в Python.
         """
-        self.logger.warning("Проверка доступа к сервису Telegram.")
         cmd = [
             "curl",
             "--proxy",
@@ -468,6 +467,7 @@ class VPNMonitor:
         self.logger.info("Старт scheduler.")
         while True:
             try:
+                self.logger.warning("Проверка доступа к сервису Telegram.")
                 res = await self.curl_test(self.port_client_xray)
                 if not res['ok']:
                     self.logger.warning("Отсутствие доступа к сервису Telegram.")
@@ -478,6 +478,7 @@ class VPNMonitor:
                     await self.movi_config(config_path)
                     await self.rebot_xray()
 
+                    self.logger.warning("Проверка доступа к сервису Telegram.")
                     res = await self.curl_test(self.port_client_xray)
                     if not res['ok']:
                         self.logger.warning("Отсутствие доступа к сервису Telegram.")
